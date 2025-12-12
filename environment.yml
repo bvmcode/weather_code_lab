@@ -1,0 +1,25 @@
+name: wx_code_lab
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - boto3
+  - scikit-learn
+  - scipy
+  - openai
+  - statsmodels
+  - plotly
+  - metpy
+  - xarray
+  - cartopy
+  - netCDF4
+  - requests
+  - siphon
+  - jupyter
+
+  
