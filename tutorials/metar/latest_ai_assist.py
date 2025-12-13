@@ -1,5 +1,8 @@
+import argparse
 import io
+import os
 import json
+import math
 from datetime import datetime
 
 import cartopy.crs as ccrs
@@ -13,35 +16,63 @@ from openai import OpenAI
 
 class MetarReport:
 
-    def __init__(self, location, write_raw_file=False):
+    def __init__(self, location, write_raw_file=False, write_bounding_box=False):
         self.location = location
-        self._get_bounding_box()
+        self.write_bounding_box = write_bounding_box
         self.write_raw_file = write_raw_file
+        self.url = None
+        self.raw_data = None
+        self.bounding_box = None
+        self.df = None
 
     def __repr__(self):
-        return (
-            f"MetarReport(location={self.location}, bounding_box={self.bounding_box})"
-        )
+        return f"MetarReport(location={self.location})"
+
+    def _write_bounding_box(self):
+        if os.path.exists("bounding_box.json"):
+            with open("bounding_box.json", "r") as f:
+                bbox_json = json.load(f)
+            bbox_json[self.location.lower()] = self.bounding_box
+            with open("bounding_box.json", "w") as f:
+                json.dump(bbox_json, f, indent=4)
+        else:
+            with open("bounding_box.json", "w") as f:
+                json.dump({self.location.lower(): self.bounding_box}, f, indent=4)
+        return True
+
+    def _load_bounding_box(self):
+        if os.path.exists("bounding_box.json"):
+            with open("bounding_box.json", "r") as f:
+                bbox_json = json.load(f)
+            if self.location.lower() in bbox_json:
+                return bbox_json[self.location.lower()]
 
     def _get_bounding_box(self):
-        model = "gpt-4o"
-        prompt = f"""
-            Provide the bounding box coordinates (south, west, north, east) for {self.location} United States.
-            The response should be in a comma separated format: `south,west,north,east` 
-            Include no additional text.
-            """
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful assistant that provides bounding box coordinates.",
-            },
-            {"role": "user", "content": prompt},
-        ]
-        client = OpenAI()
-        response = client.chat.completions.create(
-            model=model, messages=messages, max_tokens=100, temperature=0
-        )
-        self.bounding_box = response.choices[0].message.content.split(",")
+        self.bounding_box = self._load_bounding_box()
+        if self.bounding_box is None:
+            model = "gpt-4o"
+            prompt = f"""
+                Provide the bounding box coordinates (west, east, south, north) for {self.location.upper()} region/state of the United States.
+                The response should be in a comma separated format: `west,east,south,north` 
+                Include no additional text.
+                """
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that provides bounding box coordinates.",
+                },
+                {"role": "user", "content": prompt},
+            ]
+            client = OpenAI()
+            response = client.chat.completions.create(
+                model=model, messages=messages, max_tokens=100, temperature=0
+            )
+            bbox = response.choices[0].message.content.split(",")
+            self.bounding_box = [float(coord) for coord in bbox]
+        bbox_api = [self.bounding_box[2], self.bounding_box[0], self.bounding_box[3], self.bounding_box[1]]
+        self._bounding_box_api = "%2C".join([str(int(math.ceil(c))) for c in bbox_api])
+        if self.write_bounding_box:
+            self._write_bounding_box()
 
     def _create_dataframe(self):
         self.df = pd.DataFrame()
@@ -59,16 +90,18 @@ class MetarReport:
                 self.df = pd.concat([self.df, metar_df], ignore_index=True)
 
     def get_metar_report(self):
-        bbox = "%2C".join(self.bounding_box)
-        self._url_template = f"https://aviationweather.gov/api/data/metar?bbox={bbox}&format=json&taf=false"
-        self.url = self._url_template.format(bbox=bbox)
-        self.raw_data = requests.get(self.url).json()
-        self._create_dataframe()
+        self._get_bounding_box()
+        self.url = f"https://aviationweather.gov/api/data/metar?bbox={self._bounding_box_api}&format=json&taf=false"
+        print(self.url)
+        response = requests.get(self.url)
+        self.raw_data = response.json()
+        if "status" in self.raw_data:
+            if self.raw_data["status"] == "error":
+                raise ValueError(self.raw_data["error"])
         if self.write_raw_file:
-            with open("metar_raw.json", "w") as f:
+            with open(f"metar_raw_{self.location.lower()}.json", "w") as f:
                 json.dump(self.raw_data, f, indent=4)
         self._create_dataframe()
-
 
 class MetarPlot:
     def __init__(self, metar_data):
@@ -105,7 +138,8 @@ class MetarPlot:
         obs.vector_field = ["eastward_wind", "northward_wind"]
 
         panel = MapPanel()
-        panel.area = (-75.6, -73.9, 38.9, 41.4)  # [west, east, south, north] for NJ
+        panel.area = self.metar_data.bounding_box
+        print(panel.area)
         panel.projection = ccrs.PlateCarree()
         panel.layers = ["coastline", "borders", "states"]
         panel.plots = [obs]
@@ -115,11 +149,44 @@ class MetarPlot:
         pc.panels = [panel]
         rpt_hr = self.metar_data.df["report_time"].dt.hour.min()
         rprt_dt = self.metar_data.df["report_time"].dt.strftime("%Y-%m-%d").min()
-        pc.save(f"metar_obs_{rprt_dt}_{rpt_hr:02d}00.png")
+        pc.save(f"metar_obs_{rprt_dt}_{rpt_hr:02d}00_{self.metar_data.location.lower()}.png")
 
 
 if __name__ == "__main__":
-    mr = MetarReport(location="NJ", write_raw_file=True)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Fetch and plot METAR weather observations "
+            "for a specified location"
+        )
+    )
+    parser.add_argument(
+        "location",
+        type=str,
+        help=(
+            "Location/state name "
+            "(e.g., 'NJ', 'Northeast, 'Southern California')"
+        )
+    )
+    parser.add_argument(
+        "--write-raw-file",
+        action="store_true",
+        help="Write raw METAR data to JSON file",
+        default=False
+    )
+    parser.add_argument(
+        "--write-bounding-box",
+        action="store_true",
+        help="Write bounding box coordinates to bounding_box.json",
+        default=False
+    )
+
+    args = parser.parse_args()
+
+    mr = MetarReport(
+        location=args.location,
+        write_raw_file=args.write_raw_file,
+        write_bounding_box=args.write_bounding_box
+    )
     mr.get_metar_report()
     mp = MetarPlot(metar_data=mr)
     mp.plot_observations()
